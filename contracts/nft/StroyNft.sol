@@ -7,6 +7,8 @@ import "../base/ERC721.sol";
 
 contract StroyNft is ERC721, ERC721URIStorage, Ownable {
 
+   
+
     uint private price;
     address _to;
   

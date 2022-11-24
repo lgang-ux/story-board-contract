@@ -7,12 +7,15 @@ import "@openzeppelin/contracts/access/Ownable.sol";
  * nft工厂
  */
 contract StroyNftFactory is Ownable {
+
+    event mintMultipleEvent(address _nftAddress,address _to,uint256[] _tokenIds,string[] uris);
+
    //创建订单号=> nft 合约地址
     mapping(string=>address) orderNftMap;
    //创建者=> nft 合约地址
    mapping(address=>address) createNftMap;
     //创建nft合约
-    function createNft(string memory createNo,string memory name_, string memory symbol_,uint price_) public onlyOwner  returns(address) {
+   function createNft(string memory createNo,string memory name_, string memory symbol_,uint price_) public onlyOwner  returns(address) {
       address nftaddres= address(new StroyNft(name_,symbol_,price_));
       orderNftMap[createNo]=nftaddres;
       createNftMap[nftaddres]=msg.sender;
@@ -27,6 +30,7 @@ contract StroyNftFactory is Ownable {
      //批量mint
      function safeMintMultiple(address nftAddress,address to, uint256[] memory tokenIds, string[] memory uris) public  onlyOwner {
         StroyNft(nftAddress).safeMintMultiple(to,tokenIds,uris);
+        emit mintMultipleEvent(nftAddress,to,tokenIds,uris);
      }
       //转移nft合约权限
       function transferOwnerToCreator(address nftAddress) public  onlyOwner {
