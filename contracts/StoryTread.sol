@@ -2,102 +2,126 @@
 pragma solidity ^0.8.4;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC721} from "./interface/IERC721.sol";
-import {StoryDeposit} from "./StoryDeposit.sol";
-import {StoryConf} from "./StoryConf.sol";
 
+interface IStoryDeposit {
+    function lockDeposit(address _lockAddress,uint lockAmt) external;
+    function getLockDepositBalanceOf(address _owner) external returns(uint);
+    function getEffectiveDepositBalanceOf(address _owner) external returns(uint);
+    function transferLockDeposit(address _from,address _to,uint deductAmt) external;
+    function freeLockDeposit(address _from,uint deductAmt) external;
+}
 /**
 交易模块
  */
-contract StoryTread is Ownable ,StoryConf {
+contract StoryTread is Ownable {
 
-    event sellevent(address _contractAddress,address _from,uint _tokenId,uint _amt,uint _orderNo);
-    event biddingSellEvent(address _contractAddress,address _from,uint _tokenId,uint startPrice,uint minAddPirce,int limitPrice,uint strtDate,uint endDate,uint _orderNo);
-    event buyEvent(address _contractAddress,address _from,address _to,uint _tokenId,uint _amt,int _type,uint _orderNo);
-    event cancelEvent(address _contractAddress,  address _from,uint _tokenId,uint _orderNo);
-    event auctionEvent(address _contractAddress,address _from,uint _tokenId,uint _orderNo);
-    event officePiceEvent(address _contractAddress,address _from,uint _tokenId,uint _officePice,uint _orderNo);
+    event saleOderEvent(address _contractAddress,address _from,uint _tokenId,uint _amt);
+    event revokeOderEvent(address _contractAddress,address _from,uint _tokenId);
+    event buyEvent(address _contractAddress,address _from,address _to,uint _tokenId,uint sell_amt,uint user_amt,uint platform_amt);
+    event biddingSellEvent(address _contractAddress,address _from,uint _tokenId,uint startPrice,uint minAddPrice,uint limitPrice,uint strtDate,uint endDate);
+    event offerPriceEvent(address _contractAddress,address _from, uint _tokenId,uint _offerPrice);
+    event makeBiddingEvent(address _contractAddress,address _from,address _to,uint _tokenId,uint sell_amt,uint user_amt,uint platform_amt);
+    event enquiryEvent(address _contractAddress,address _from,address _to,uint _tokenId,uint price);
+    event makeEnquiryEvent(address _contractAddress,address _from,address _to,uint _tokenId,uint sell_amt,uint user_amt,uint platform_amt);
+    //contract => tokenId =>price  
+    mapping(address =>mapping(uint =>uint)) private contractTokenSaleMap;
+    //contract => tokenId => owner  
+    mapping(address =>mapping(uint =>address)) private ownerOrderMap;
+    //contract => tokenId => biddingOrder 
+    mapping(address => mapping(uint => Bidding)) private biddingTokenSaleMap;
+     //contract =>tokenId => offer price
+    mapping(address =>mapping(uint => Offer[])) private offerMap;
+    //contract =>tokenId => max offer price
+    mapping(address =>mapping(uint => Offer)) private maxOfferMap;
+    //contract => tokenId => boola 限价
+    mapping(address => mapping(uint => bool)) private limitBiddingMap;
+    //enquirey log
+    mapping(address =>mapping(uint => Enquiry[])) private enquiryMap;
 
-    //当前订单挂点信息
-    mapping(address => mapping(uint=>Order)) private orderMap;
-    //成交历史订单信息
-    mapping(address => mapping(uint=>Order[])) private orderMapHis;
-    //订单号存储
-    mapping(address => mapping(uint=>OrderNoInfo)) private orderNoInfoMap;
-    //报价信息合约地址=>tokenid=>orderNo =>出价列表
-    mapping(address => mapping(uint=>mapping(uint =>OfficePiceInfo[]))) private officePiceMapList;
-    //最新高出价 合约地址=>tokenid=>orderNo =>出价
-    mapping(address => mapping(uint=>mapping(uint =>OfficePiceInfo))) private officePiceMap;
-
-
-     struct OfficePiceInfo{
-        address officeWoner;//报价人
-        address contractAddress;//nft合约地址
-        uint tokenId;//tokenId
-        uint orderNo;//报价订单号
-        uint officePice;//出价
-        uint  officeTime;//出价时间
-     }
     
-     struct OrderNoInfo{
-         address contractAddress;//nft合约地址
-         uint tokenId ;
-         uint orderNo;
-    }
+    address private txServiceFeeAddress; //交易服务费地址
 
-    struct Order{
-        uint  orderNo;
-        address from ;
-        address contractAddress;
-        uint tokenId ; 
-        uint price; //交易金额
-        address to; //购买者
-        bool status; //交易状态
-        int  _type;//0 出价单 1 竞拍订单
+    uint private tradeFeeRate = 50 ;//交易服务费 5% 1000倍
+    
+    uint private enquiryOutTime = 48 * 60 * 60; 
+
+
+   struct Bidding {
+        address from;
+        uint startPrice;//起拍价格
+        uint minAddPrice; //最低加价
+        uint limitPrice ;//限价
         uint startDate; //开始时间
-        uint  endDate; //结束时间
-        uint raisePrice; //最低加价
-    }
+        uint endDate; //结束时间
+   }
 
+   struct Offer {
+       address offerAddress;
+       uint offerPrice;
+   }
+   
+   struct Enquiry{
+    address enquiryAddress;
+    uint price;
+    uint time; //询价时间
+   }
+   
     address private storyDepositAddress; //保证金合约
     constructor(address _storyDepositAddress) {
         storyDepositAddress = _storyDepositAddress;
     }
 
-
-
      //挂单
-     function sell(address _contractAddress,uint _tokenId, uint _price) public{
-        require(checkSell(_contractAddress,_tokenId),"The same TokenId cannot be placed repeatedly!");
+     function sale(address _contractAddress,uint _tokenId, uint _price) public{
+        require(IERC721(_contractAddress).isApprovedForAll(msg.sender,address(this)),"NFT does not ApprovedForAll");
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"token does not belong to you.");
+        require(contractTokenSaleMap[_contractAddress][_tokenId]  == 0,"NFT already on sale.");
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from == address(0),"Auction order already exists.");
         require(_price > 0,"sell price must than zero.");
-        //检查tokenId 是否属于msg.sender
-        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"tokenId not belong to wallet.");
-        //授权转出NFT 至 平台合约
-        IERC721(_contractAddress).transferFrom(msg.sender,address(this),_tokenId);
-        uint orderNo=createOrderNo(_contractAddress,_tokenId);
-        //记录当前订单
-        uint endDate = block.timestamp + 360*24*60*60;
-        orderMap[_contractAddress][_tokenId]=Order(orderNo,msg.sender,_contractAddress,_tokenId,_price,address(0),false,0,block.timestamp,endDate,0);
-        emit sellevent(_contractAddress,msg.sender,_tokenId,_price,orderNo);
+        contractTokenSaleMap[_contractAddress][_tokenId] = _price;
+        ownerOrderMap[_contractAddress][_tokenId] = msg.sender;
+        emit saleOderEvent(_contractAddress,msg.sender,_tokenId,_price);
     }
 
+    //批量挂单
+    function saleBatch(address _contractAddress,uint[] memory _tokenIds, uint[] memory _prices) public{
+        require(_tokenIds.length > 0,"token is null");
+        require(_prices.length > 0,"price is null");
+         require(_tokenIds.length == _prices.length ,"token number and price number not match.");
+        for(uint idx = 0; idx < _tokenIds.length ; idx++){
+            sale(_contractAddress,_tokenIds[idx],_prices[idx]);
+        }
+    }
 
-     //正常订单成交
+    //撤单
+    function revoke(address _contractAddress,uint _tokenId) public{
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"token does not belong to you.");
+        require(contractTokenSaleMap[_contractAddress][_tokenId] > 0,"NFT sell order does not exist.");
+        require(ownerOrderMap[_contractAddress][_tokenId] == msg.sender,"The order does not belong to you.");
+        delete contractTokenSaleMap[_contractAddress][_tokenId] ;
+        delete ownerOrderMap[_contractAddress][_tokenId] ;
+        emit revokeOderEvent(_contractAddress,msg.sender,_tokenId);
+    }
+
+    //订单成交
      function buy(address _contractAddress,uint _tokenId) public payable {
-        require(!checkSell(_contractAddress,_tokenId),"The order does not exist or has been filled!");
-        Order memory _order=orderMap[_contractAddress][_tokenId];
-        uint platformFee = msg.value/1000 * StoryConf.getTradeFeeRate(); //平台扣点
-        uint userAmt = msg.value - platformFee; //用户
-        require(_order._type ==0,"This is not a normal sales order. We can't close the deal.");
-        require(_order.price <=msg.value,"the amount filled ");
-        IERC721(_contractAddress).transferFrom(address(this),msg.sender,_tokenId);
-        payable(_order.from).transfer(userAmt); 
-        payable(StoryConf.getTxServiceFeeAddress()).transfer(platformFee);
-        _order.to=msg.sender;
-        _order.status = true;
-        orderMap[_contractAddress][_tokenId]=_order;
-        orderMapHis[_contractAddress][_tokenId].push(_order);//售出后存日历史表
-        emit buyEvent(_contractAddress,_order.from,msg.sender,_tokenId,msg.value,_order._type,_order.orderNo);
+        address orderOwner = ownerOrderMap[_contractAddress][_tokenId];
+        uint orderPrice = contractTokenSaleMap[_contractAddress][_tokenId];
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == orderOwner ,"There is an error in token attribution.");
+        require(orderPrice > 0,"NFT sell order does not exist.");
+        require(msg.value >= orderPrice,"Insufficient purchase amount.");
+        require(orderOwner != msg.sender,"You can't buy yourself.");
+        uint platformFee = msg.value/1000 * tradeFeeRate; //平台扣点
+        uint userAmt = msg.value - platformFee; //用户收款
+        delete contractTokenSaleMap[_contractAddress][_tokenId] ;
+        delete ownerOrderMap[_contractAddress][_tokenId] ;
+        delete enquiryMap[_contractAddress][_tokenId]; //清理询价记录
+        payable(orderOwner).transfer(userAmt); 
+        payable(txServiceFeeAddress).transfer(platformFee);
+        IERC721(_contractAddress).transferFrom(orderOwner,msg.sender,_tokenId); //转移NFT
+        emit buyEvent(_contractAddress,orderOwner,msg.sender,_tokenId,msg.value,userAmt,platformFee);
     }
+
 
     /**
         竞拍挂单
@@ -105,168 +129,173 @@ contract StoryTread is Ownable ,StoryConf {
         _tokenId TokenId
         startPrice 起拍价格
         minAddPrice 最小加价
-        limitPrice 是否限价
+        limitPrice 限价
         startDate 开始时间
         endDate 结束时间
      */
-     function biddingSell(address _contractAddress,uint _tokenId, uint startPrice,uint minAddPirce,int limitPrice,uint strtDate,uint endDate) public{
-        require(checkSell(_contractAddress,_tokenId),"The same TokenId cannot be placed repeatedly!");
+     function biddingSell(address _contractAddress,uint _tokenId, uint startPrice,uint minAddPrice,uint limitPrice,uint strtDate,uint endDate) public{
+        require(IERC721(_contractAddress).isApprovedForAll(msg.sender,address(this)),"NFT does not ApprovedForAll");
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"token does not belong to you.");
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from == address(0),"Auction order already exists.");
+        require(contractTokenSaleMap[_contractAddress][_tokenId]  == 0,"NFT already on sale.");
         require(startPrice > 0,"The starting price must be greater than 0.");
-        require(minAddPirce > 0,"The minimum markup must be greater than 0.");
+        require(minAddPrice > 0,"The minimum markup must be greater than 0.");
         require(endDate > block.timestamp,"endDate less than timestamp.");
-        //检查tokenId 是否属于msg.sender
-        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"tokenId not belong to wallet.");
-        //授权转出NFT 至 平台合约
-        IERC721(_contractAddress).transferFrom(msg.sender,address(this),_tokenId);
-        uint orderNo=createOrderNo(_contractAddress,_tokenId);
-        //记录当前订单
-        orderMap[_contractAddress][_tokenId]=Order(orderNo,msg.sender,_contractAddress,_tokenId,1,address(0),false,1,strtDate,endDate,minAddPirce);
-        emit biddingSellEvent(_contractAddress,msg.sender,_tokenId,startPrice,minAddPirce,limitPrice,strtDate,endDate,orderNo);
+        biddingTokenSaleMap[_contractAddress][_tokenId] = Bidding(msg.sender,startPrice,minAddPrice,limitPrice,strtDate,endDate);
+        emit biddingSellEvent(_contractAddress,msg.sender,_tokenId,startPrice,minAddPrice,limitPrice,strtDate,endDate);
     }
 
-    //竞拍成交
-     function biddingBuy(address _contractAddress,uint _tokenId) public payable {
-        require(!checkSell(_contractAddress,_tokenId),"The order does not exist or has been filled!");
-        Order memory _order=orderMap[_contractAddress][_tokenId];
-        require(_order._type == 1,"No auction order, no transaction.");
-        uint platformFee = msg.value/1000 * StoryConf.getTradeFeeRate(); //平台扣点
-        uint userAmt = msg.value - platformFee; //用户
-        require( isSelled(_contractAddress,  _tokenId),"The order does not exist or has been filled!");  //检查时间未受已经结束
-        OfficePiceInfo memory officePiceInfo= officePiceMap[_contractAddress][_tokenId][_order.orderNo]; //获取最高价
-        require(officePiceInfo.officePice <= msg.value,"the amount filled");
-        require(officePiceInfo.officeWoner ==msg.sender,"the officeWoner filled");
-        IERC721(_contractAddress).transferFrom(address(this),msg.sender,_tokenId);
-        payable(_order.from).transfer(userAmt); 
-        payable(StoryConf.getTxServiceFeeAddress()).transfer(platformFee);
-        _order.to=msg.sender;
-        _order.status = true;
-        orderMap[_contractAddress][_tokenId]=_order;
-        orderMapHis[_contractAddress][_tokenId].push(_order);
-        emit buyEvent(_contractAddress,_order.from,msg.sender,_tokenId,msg.value,_order._type,_order.orderNo);
-        
+    //撤销订单（未成交 和 没有报价的情况下 用户主动撤销）
+    function biddingRevoke(address _contractAddress,uint _tokenId) public {
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"token does not belong to you.");
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from != address(0),"Auction order does not exist.");
+        require(maxOfferMap[_contractAddress][_tokenId].offerPrice == 0,"Offer already exists and cannot be revoked");
+        delete biddingTokenSaleMap[_contractAddress][_tokenId] ;
+        emit revokeOderEvent(_contractAddress, msg.sender,_tokenId);
     }
 
-
-
-    //撤销订单（未成交 和 没有报价的情况下 可以直接撤销）
-    function cancel(address _contractAddress,uint _tokenId) public {
-        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"tokenId not belong to wallet.");
-        Order memory order =  orderMap[_contractAddress][_tokenId];
-        require(order.from == msg.sender ,"Order does not exist. ");
-        require(order.status,"The order is sealed and cannot be cancelled.");
-        OfficePiceInfo memory c_officePiceInfo=  officePiceMap[_contractAddress][_tokenId][order.orderNo];
-        require(order._type == 1 && c_officePiceInfo.officePice > 0 ,"There's an offer. It can't be undone.");
-        IERC721(_contractAddress).transferFrom(address(this),order.from,_tokenId);
-        delete  orderMap[_contractAddress][_tokenId];
-        emit cancelEvent(_contractAddress, msg.sender,_tokenId, order.orderNo);
-    }
-
-    //处理流拍情况,只是处理有出价的情况
-    function auction(address _contractAddress,uint _tokenId,uint _orderNo) public{
-        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"tokenId not belong to wallet.");
-        Order memory order =  orderMap[_contractAddress][_tokenId];
-        require(order.from == msg.sender ,"Order does not exist. ");
-        require(order.status,"The order is sealed and cannot be cancelled.");
-        require(order._type == 0,"The order type is incorrect.");
-        OfficePiceInfo memory c_officePiceInfo=  officePiceMap[_contractAddress][_tokenId][_orderNo];
-        require(c_officePiceInfo.officePice == 0,"No quotation information, non-streaming order.");
-        require(block.timestamp - order.endDate < StoryConf.getExpiration(),"Not more than Time, can not be counted as a lost order.");
-        address officeWallet = c_officePiceInfo.officeWoner; //找到出价最高的
-        IERC721(_contractAddress).transferFrom(address(this),order.from,_tokenId); //退回NFT
-        delete orderMap[_contractAddress][_tokenId]; //删除订单
-        delete officePiceMap[_contractAddress][_tokenId][_orderNo];//删除本次出价记录
-        delete officePiceMapList[_contractAddress][_tokenId][_orderNo];
-        emit auctionEvent(_contractAddress,officeWallet,_tokenId,_orderNo);  //创建锁定保证金事件
-        
-    }
-
-    /**
-        竞拍出价合约
-        判断是否可以出价 时间结束 是否已经被竞拍
-        判断出价金额是否大于价最高
-      */
-     function officePice(address _contractAddress, uint _tokenId,uint orderNo,uint _officePice) public{
-        uint depositAmt = StoryDeposit(storyDepositAddress).getDeposit(msg.sender);
-        require(depositAmt > depositAmt /100 * StoryConf.getDepositProportion(),"Insufficient security deposit.");
-        require(!isSelled(_contractAddress,_tokenId),"the product  is sell");
-        Order memory _order = orderMap[_contractAddress][_tokenId];
-        require(_order.orderNo == orderNo && _order._type == 1,"order is erro" );
-        OfficePiceInfo memory c_officePiceInfo=  officePiceMap[_contractAddress][_tokenId][orderNo];//获取当前挂单的nft
-        require(c_officePiceInfo.officePice < _officePice,"the order office is min" );
-        require(_officePice - c_officePiceInfo.officePice > _order.raisePrice,"The markup base is too small");
-        OfficePiceInfo memory  officePiceInfo= OfficePiceInfo(msg.sender,_contractAddress,_tokenId,orderNo,_officePice,block.timestamp);
-        officePiceMap[_contractAddress][_tokenId][orderNo]=officePiceInfo;
-        officePiceMapList[_contractAddress][_tokenId][orderNo].push(officePiceInfo);
-        emit officePiceEvent(_contractAddress,msg.sender,_tokenId,_officePice,orderNo);
+    //竞拍出价
+     function offerPrice(address _contractAddress, uint _tokenId,uint _offerPrice) public{
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from != address(0),"Auction order does not exist.");
+        Bidding memory bidding = biddingTokenSaleMap[_contractAddress][_tokenId];
+        require(block.timestamp > bidding.startDate,"The auction has not yet started.");
+        require(block.timestamp < bidding.endDate,"auction has ended.");
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from != msg.sender,"You can't offer yourself.");
+        require(_offerPrice > maxOfferMap[_contractAddress][_tokenId].offerPrice + bidding.minAddPrice,"offer price too small,less than last offer");
+        uint depositAmt = IStoryDeposit(storyDepositAddress).getEffectiveDepositBalanceOf(msg.sender);
+        require(depositAmt >= _offerPrice,"Insufficient margin available balance.");
+        IStoryDeposit(storyDepositAddress).lockDeposit(msg.sender,_offerPrice); //lock deposit
+        maxOfferMap[_contractAddress][_tokenId] = Offer(msg.sender,_offerPrice);
+        offerMap[_contractAddress][_tokenId].push(Offer(msg.sender,_offerPrice));
+        if(bidding.limitPrice != 0  && _offerPrice > bidding.limitPrice){
+            limitBiddingMap[_contractAddress][_tokenId] = true;
+        }
+        emit offerPriceEvent(_contractAddress,msg.sender,_tokenId,_offerPrice);
      }
 
-
-
-
-    function createOrderNo(address _contractAddress,uint _tokenId) public returns(uint){
-        OrderNoInfo memory orderNoInfo= orderNoInfoMap[_contractAddress][_tokenId];
-        if(orderNoInfo.tokenId > 0 ){
-            orderNoInfo.tokenId=orderNoInfo.tokenId+1;
-            return orderNoInfo.tokenId;
+     
+    //竞拍成交 -- 账户自动成交
+     function makeBidding(address _contractAddress, uint _tokenId) public onlyOwner{
+        require(biddingTokenSaleMap[_contractAddress][_tokenId].from != address(0),"Auction order does not exist.");
+        Bidding memory bidding = biddingTokenSaleMap[_contractAddress][_tokenId];
+        if(limitBiddingMap[_contractAddress][_tokenId] == false){  //检查是否满足限价成交 - 如果满足则不检查时间
+            require(block.timestamp > bidding.endDate,"The auction is not over yet.");
         }
-        orderNoInfoMap[_contractAddress][_tokenId]=OrderNoInfo(_contractAddress,_tokenId,1);
-        return 1;
-        
+        Offer memory maxOffer = maxOfferMap[_contractAddress][_tokenId];
+        require(IStoryDeposit(storyDepositAddress).getLockDepositBalanceOf(maxOffer.offerAddress) >= maxOffer.offerPrice,"Insufficient lock-up margin, unable to trade.");
+        uint platformFee = maxOffer.offerPrice/1000 * tradeFeeRate; //平台扣点
+        uint userAmt =  maxOffer.offerPrice - platformFee; //用户收款
+        delete biddingTokenSaleMap[_contractAddress][_tokenId]; 
+        delete maxOfferMap[_contractAddress][_tokenId];
+        delete limitBiddingMap[_contractAddress][_tokenId];
+        IERC721(_contractAddress).transferFrom(bidding.from,maxOffer.offerAddress,_tokenId); //转移NFT
+        IStoryDeposit(storyDepositAddress).transferLockDeposit(maxOffer.offerAddress,bidding.from,userAmt);
+        IStoryDeposit(storyDepositAddress).transferLockDeposit(maxOffer.offerAddress,txServiceFeeAddress,platformFee);
+        Offer[] memory offers = offerMap[_contractAddress][_tokenId];
+        for(uint256 idx  = 0; idx < offers.length ; idx++ ){   //解除其他出价用户保证金
+            Offer memory offer = offers[idx];
+            if(offer.offerAddress != maxOffer.offerAddress && IStoryDeposit(storyDepositAddress).getLockDepositBalanceOf(offer.offerAddress) >= offer.offerPrice){ //防止释放错误 导致成交失败.
+                IStoryDeposit(storyDepositAddress).freeLockDeposit(offer.offerAddress,offer.offerPrice);
+                 delete offerMap[_contractAddress][_tokenId][idx];
+            }
+        }
+        delete offerMap[_contractAddress][_tokenId];
+        emit makeBiddingEvent(_contractAddress,bidding.from,maxOffer.offerAddress,_tokenId,maxOffer.offerPrice,userAmt,platformFee);
+     }
+
+    /**
+     * 询价
+     */
+    function enquiry(address _contractAddress,uint _tokenId,uint price)public {
+         require(contractTokenSaleMap[_contractAddress][_tokenId]  > 0 ,"NFT not sale.");
+         address owner = IERC721(_contractAddress).ownerOf(_tokenId);
+         uint depositAmt = IStoryDeposit(storyDepositAddress).getEffectiveDepositBalanceOf(msg.sender);
+         require(depositAmt >= price,"Insufficient available margin." );
+         require(owner != msg.sender,"You can't enquiry yourself.");
+         IStoryDeposit(storyDepositAddress).lockDeposit(msg.sender,price); //lock deposit
+         enquiryMap[_contractAddress][_tokenId].push(Enquiry(msg.sender,price,block.timestamp));
+         emit enquiryEvent(_contractAddress,owner,msg.sender,_tokenId,price);
     }
 
+    //询价成交
+    function makeEnquiry(address _contractAddress,uint _tokenId,address _to)public {
+        require(IERC721(_contractAddress).ownerOf(_tokenId) == msg.sender ,"token does not belong to you.");
+        Enquiry[] memory enquirys = enquiryMap[_contractAddress][_tokenId];
+        Enquiry memory exitsEnquiry ;
+        for(uint256 i = 0; i< enquirys.length ;i++){
+            if(enquirys[i].enquiryAddress  == _to ){
+                exitsEnquiry = enquirys[i];
+            }
+        }
+        require(exitsEnquiry.time > block.timestamp - enquiryOutTime,"The inquiry is over 48H.");
+        require(exitsEnquiry.enquiryAddress != address(0),"The inquiry user does not exist.");
+        uint lockAmt = IStoryDeposit(storyDepositAddress).getLockDepositBalanceOf(exitsEnquiry.enquiryAddress ) ;
+        require(lockAmt >= exitsEnquiry.price,"lock deposit Insufficient.");
+        uint platformFee = exitsEnquiry.price/1000 * tradeFeeRate; //平台扣点
+        uint userAmt =  exitsEnquiry.price - platformFee; //用户收款
+        //clean sale order detail
+        delete contractTokenSaleMap[_contractAddress][_tokenId] ;
+        delete ownerOrderMap[_contractAddress][_tokenId] ;
+
+        IERC721(_contractAddress).transferFrom(msg.sender,exitsEnquiry.enquiryAddress,_tokenId); //转移NFT
+        IStoryDeposit(storyDepositAddress).transferLockDeposit(exitsEnquiry.enquiryAddress,msg.sender,userAmt);
+        IStoryDeposit(storyDepositAddress).transferLockDeposit(exitsEnquiry.enquiryAddress,txServiceFeeAddress,platformFee);
+        //clean other enquity 
+        for(uint256 idx  = 0; idx < enquirys.length ; idx++ ){   //解除其他出价用户保证金
+            Enquiry memory offer = enquirys[idx];
+            if(offer.enquiryAddress != msg.sender && IStoryDeposit(storyDepositAddress).getLockDepositBalanceOf(offer.enquiryAddress) >= offer.price){ //防止释放错误 导致成交失败.
+                IStoryDeposit(storyDepositAddress).freeLockDeposit(offer.enquiryAddress,offer.price);
+            }
+        }
+        delete enquiryMap[_contractAddress][_tokenId];
+        emit makeEnquiryEvent(_contractAddress,msg.sender,exitsEnquiry.enquiryAddress,_tokenId,exitsEnquiry.price,userAmt,platformFee);
+    }
+
+    //清理询价
+    function cleanEnquiry(address _contractAddress,uint _tokenId) public onlyOwner{
+        Enquiry[] memory enquirys = enquiryMap[_contractAddress][_tokenId];
+        for(uint256 idx  = 0; idx < enquirys.length ; idx++ ){  
+        Enquiry memory offer = enquirys[idx];
+        if(offer.time < block.timestamp - enquiryOutTime && IStoryDeposit(storyDepositAddress).getLockDepositBalanceOf(offer.enquiryAddress) >= offer.price){ //防止释放错误 导致成交失败.
+            IStoryDeposit(storyDepositAddress).freeLockDeposit(offer.enquiryAddress,offer.price);
+            delete enquiryMap[_contractAddress][_tokenId][idx];
+        }
+      }
+    }
+
+
+    function getEnquirys(address _contractAddress,uint _tokenId) public view returns(Enquiry[] memory){
+        return enquiryMap[_contractAddress][_tokenId];
+    }
+
+
+    function getSaleOrder(address _contractAddress,uint _tokenId) public view returns(bool){
+         return contractTokenSaleMap[_contractAddress][_tokenId] > 0;
+     }
+
+    function getBiddingOrder(address _contractAddress,uint _tokenId) public view returns(bool){
+         return biddingTokenSaleMap[_contractAddress][_tokenId].from != address(0);
+    }
+
+    function isEnquiry(address _contractAddress,uint _tokenId) public view returns(bool){
+         return enquiryMap[_contractAddress][_tokenId].length > 0;
+    }
+
+    function setTxServiceFeeAddress(address _txServiceFeeAddress) public onlyOwner {
+        txServiceFeeAddress = _txServiceFeeAddress;
+    }
     
-
-    /**
-     验证订单是否卖出  true 未售出已过期  
-     */
-    function isSelled(address _contractAddress, uint _tokenId) private view returns(bool){
-          address from= orderMap[_contractAddress][_tokenId].from;
-          bool status= orderMap[_contractAddress][_tokenId].status;
-          uint endDate= orderMap[_contractAddress][_tokenId].endDate;
-          return  (from != address(0) && status==false && endDate < block.timestamp);
-    }
-     /**
-     获取历史订单
-      */
-    function  getHisOrder(address _contractAddress, uint _tokenId) public view returns(Order[] memory orders,Order memory order) {
-        orders= orderMapHis[_contractAddress][_tokenId];
-        return (orders,orderMap[_contractAddress][_tokenId]);
+    function setTradeFeeRate(uint _tradeFeeRate) public onlyOwner {
+        tradeFeeRate = _tradeFeeRate;
     }
 
-    /**
-    获取当前最新订单
-     */
-    function  getOrder(address _contractAddress, uint _tokenId) public view returns(Order memory order) {
-        return orderMap[_contractAddress][_tokenId];
+    function getTxServiceFeeAddress() public view returns(address){
+        return txServiceFeeAddress;
     }
-
-
-    /**
-        获取当前竞拍历史出价
-    */
-    function  getHisOfficeOrder(address _contractAddress, uint _tokenId) public view returns(OfficePiceInfo[] memory orders) {
-        return officePiceMapList[_contractAddress][_tokenId][orderMap[_contractAddress][_tokenId].orderNo];
+ 
+    function getTradeFeeRate() public view returns(uint){
+        return tradeFeeRate;
     }
-    /**
-        获取当前最新出价
-     */
-    function  getOfficeOrder(address _contractAddress, uint _tokenId) public view returns(OfficePiceInfo memory orders) {
-        return officePiceMap[_contractAddress][_tokenId][orderMap[_contractAddress][_tokenId].orderNo];
-    }
-
-    
-    /**
-     验证订单状态是否为false 如果为fase
-     1 验证order是否为空
-     2 验证订单是否已经卖出
-     3 验证订单是否已经截止
-     */
-    function checkSell(address _contractAddress, uint _tokenId) private view returns(bool){
-         address from= orderMap[_contractAddress][_tokenId].from;
-         bool status= orderMap[_contractAddress][_tokenId].status;
-         return from == address(0) || (from != address(0) && status==true );
-    }
-
-
+ 
 
 }

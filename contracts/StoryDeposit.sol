@@ -1,75 +1,95 @@
 // SPDX-License-Identifier: SEE LICENSE IN LICENSE
 pragma solidity ^0.8.4;
 import "@openzeppelin/contracts/access/Ownable.sol";
-import {StoryConf} from "./StoryConf.sol";
 
 
 /**
 保证金管理合约
  */
-contract StoryDeposit is StoryConf{
+contract StoryDeposit is Ownable{
 
 
-    event depositEvent(address from,uint depositAmt,uint totalDepositAmt);
-    event withDepositEvent(address to,uint depositAmt,uint balance);
-    event deductDepositEvent(address from,address to,uint platformAmt,uint userAmt,uint balance);
-    event lockDepositEvent(address _lockAddress);
+    event depositEvent(address _address,uint depositAmt);
+    event withDepositEvent(address _address,uint withAmt,uint balanceOf);
+    event lockDepositEvent(address _lockAddress,uint lockAmt,uint availableAmt);
+    event transferLockDepositEvent(address from,address to,uint  deductAmt);
+    event freeLockDepositEvent(address _address,uint availableAmt, uint lockAmt);
 
-    mapping(address=>uint) private depositMap; //保证金
-    mapping(address =>bool) private lockMap; //锁定
+    mapping(address=>uint) private availableDepositMap; //可用保证金
+    mapping(address =>uint) private lockDepositMap; //锁定保证金
+
+
+
+    address private tradeOwnerAddress;
+    modifier tradeOwner(){
+        require(tradeOwnerAddress == msg.sender,"only owner call this");
+        _;
+    }
+
+    function setTradeOwnerAddress(address _tradeOwner) public onlyOwner{
+        tradeOwnerAddress  = _tradeOwner;
+    }
+
+
 
     //质押保证金
     function deposit() payable public{
         require(msg.value > 0 ,"deposit must than zero.");
-        uint depositAmt = depositMap[msg.sender] ;
-        depositMap[msg.sender] = depositAmt + msg.value;
-        emit depositEvent(msg.sender,msg.value,depositMap[msg.sender] );
+        uint depositAmt = availableDepositMap[msg.sender] ;
+        uint availableAmt =  depositAmt + msg.value;
+        availableDepositMap[msg.sender] =availableAmt;
+        emit depositEvent(msg.sender,availableAmt );
     }
 
     //赎回保证金
-    function withDeposit(uint amt) public{
-        uint depositAmt = depositMap[msg.sender];
-        require(depositAmt > 0 ,"deposit is not present.");
-        require(amt > 0 ,"deduct deposit must than zero.");
-        require(depositAmt > amt,"deduct deposit Out of limit." );
-        require(lockMap[msg.sender],"deposit locked. ");
-        depositMap[msg.sender] = depositAmt - amt;
-        payable(msg.sender).transfer(amt); 
-        emit withDepositEvent(msg.sender,amt,depositMap[msg.sender]);
+    function withDeposit(uint withAmt) public{
+        uint effectiveDepositAmt = availableDepositMap[msg.sender];
+        require(withAmt > 0 ,"deduct deposit must than zero.");
+        require(effectiveDepositAmt > withAmt,"Insufficient Available deposit." );
+        uint balanceOf = effectiveDepositAmt - withAmt;
+        availableDepositMap[msg.sender] = balanceOf;
+        payable(msg.sender).transfer(withAmt); 
+        emit withDepositEvent(msg.sender,withAmt,balanceOf);
+    }
+    //锁定保证金 
+    function lockDeposit(address _lockAddress,uint lockAmt) public tradeOwner{
+        require(availableDepositMap[_lockAddress] > lockAmt,"Insufficient available Balance.");
+        uint alreadyLockAmt = lockDepositMap[_lockAddress] ;
+        uint lock = alreadyLockAmt + lockAmt;
+        uint available = availableDepositMap[_lockAddress] - lockAmt;
+        lockDepositMap[_lockAddress] = lock;
+        availableDepositMap[_lockAddress] = available;
+        emit lockDepositEvent(_lockAddress,lock,available);
     }
 
-    //锁定保证金 - 全额锁仓
-    function lockDeposit(address _lockAddress) public onlyOwner{
-        require(depositMap[msg.sender] > 0, "The margin does not exist");
-        lockMap[_lockAddress] = true;
-        emit lockDepositEvent(_lockAddress);
+    //转移保证金 竞拍自动成交. 
+    function transferLockDeposit(address _from,address _to,uint deductAmt) public tradeOwner{
+        require(deductAmt > 0,"deduct deposit must be greater than 0.");
+        uint lockDepositAmt = lockDepositMap[_from];
+        require(lockDepositAmt >0  && lockDepositAmt > deductAmt,"Insufficient lock-up deposit.");
+        uint lockAmt = lockDepositAmt - deductAmt;
+        lockDepositMap[_from] = lockAmt;
+        payable(_to).transfer(deductAmt);
+        emit transferLockDepositEvent(_from,_to,lockAmt);
     }
 
-    //扣除保证金
-    function deductDeposit(address _from,address _to,uint _startAmt) public onlyOwner{
-        require(_startAmt > 0,"The starting price must be greater than 0.");
-        require(_to == address(0),"The source address does not exist.");
-        uint depositAmt = depositMap[_from];
-        uint deductAmt = _startAmt /100 * StoryConf.getDepositProportion();
-        require(depositAmt > deductAmt,"Insufficient security deposit.");
-        uint platformDeductAmt = deductAmt /100 * StoryConf.getDepositFeeRate() ;
-        require(platformDeductAmt > deductAmt,"platform deduct than deductAmt.");
-        uint userDeductAmt = deductAmt - platformDeductAmt;
-        require(userDeductAmt > deductAmt,"user deduct than deductAmt.");
-        require( StoryConf.getDepositFeeAddress() == address(0),"The depositFeeAddress does not exist.");
-        payable(StoryConf.getDepositFeeAddress()).transfer(platformDeductAmt);
-        payable(_to).transfer(userDeductAmt);
-        uint balanceOf = depositAmt - deductAmt;
-        depositMap[_from] = balanceOf;
-        delete lockMap[_from];
-        emit deductDepositEvent(_from,_to,platformDeductAmt,userDeductAmt,balanceOf);
-    }
-
-    //获取保证金
-    function getDeposit(address _owner) public view returns(uint){
-        return depositMap[_owner];
+    //释放锁定保证金
+    function freeLockDeposit(address _from,uint deductAmt) public tradeOwner{
+        uint lockDepositAmt = lockDepositMap[_from];
+        require(lockDepositAmt >= deductAmt,"Insufficient lock-up deposit.");
+        lockDepositMap[_from] = lockDepositMap[_from] - deductAmt;
+        availableDepositMap[_from] = availableDepositMap[_from] + deductAmt;
+        emit freeLockDepositEvent(_from,availableDepositMap[_from],lockDepositMap[_from]);
     }
 
 
+    //可用保证金
+    function getEffectiveDepositBalanceOf(address _address) public view returns(uint){
+        return availableDepositMap[_address] ;
+    }
+    //获取保证金锁定
+    function getLockDepositBalanceOf(address _address) public view returns(uint){
+        return lockDepositMap[_address];
+    } 
 
 }
